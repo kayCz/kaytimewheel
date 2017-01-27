@@ -2,81 +2,118 @@ package timewheel
 
 import (
 	"time"
+	"container/list"
+	"strings"
 	"sync"
 )
 
-type TimeWheel struct {
-	ticker *time.Ticker
-	currentTick int
-	tickPeriod time.Duration
-	ticksWheel int
-	lock sync.RWMutex
-	quit chan bool
-	slots []chan bool
+type SlotJob struct {
+	sum int
+	do func()
 }
 
-func NewTimeWheel(tickPeriod time.Duration, ticksWheel int) *TimeWheel{
-	ticker := time.NewTicker(tickPeriod)
-	tw := &TimeWheel {
+type Slot struct {
+	lock *sync.Mutex
+	hooks *list.List
+}
+
+type TimeWheel struct {
+	ticker *time.Ticker
+	period time.Duration
+	tickLife int
+	slots []*Slot
+	currentTick int
+}
+
+func NewTimeWheel(period time.Duration, tickLift int) *TimeWheel {
+	ticker := time.NewTicker(period)
+	tw := &TimeWheel{
 		ticker : ticker,
-		currentTick : 0,
-		tickPeriod : tickPeriod,
-		ticksWheel : ticksWheel,
-		lock : sync.RWMutex{},
-		quit : func() chan bool{
-			return make(chan bool)
-		}(),
-		slots : func() []chan bool{
-			s := make([]chan bool, 0, ticksWheel)
-			for i := 0; i < ticksWheel ; i++ {
-				s = append(s, make(chan bool))
+		period : period,
+		tickLife : tickLift,
+		slots : func() []*Slot {
+			s := make([]*Slot, 0, tickLift + 1)
+			for i := 0 ; i < tickLift + 1 ; i ++ {
+				s = append(s, &Slot{hooks : list.New(),lock : &sync.Mutex{}})
 			}
 			return s
 		}(),
+		currentTick : 0,
 	}
 
-	go tw.run()
+	go func() {
+		for i := 1; ; i ++ {
+			i = i % tw.tickLife
+			<- tw.ticker.C
+			tw.currentTick = i
+			tw.notify(i)
+		}
+	}()
 
 	return tw
 }
 
-func (wheel *TimeWheel) run() {
-	for {
-		select {
-			case <- wheel.quit:
-				wheel.ticker.Stop()
-			case <- wheel.ticker.C:
-				wheel.do()
-
+func (w *TimeWheel) notify(index int) {
+	slots := w.slots[index]
+	slots.lock.Lock()
+	var n *list.Element
+	for e := slots.hooks.Front() ; nil != e ; e = n{
+		v := e.Value.(*SlotJob)
+		v.sum--
+		n = e.Next()
+		if v.sum < 0 {
+			slots.hooks.Remove(e)
+			go v.do()
 		}
 	}
+	slots.lock.Unlock()
 }
 
-func (wheel *TimeWheel) do() {
-	wheel.lock.Lock()
-	last := wheel.slots[wheel.currentTick]
-	wheel.slots[wheel.currentTick] = make(chan bool)
-	wheel.currentTick = (wheel.currentTick + 1) % wheel.ticksWheel
-	close(last)
-	wheel.lock.Unlock()
-}
-
-func (wheel *TimeWheel) After(timeout time.Duration) <-chan bool{
-	if timeout >= wheel.tickPeriod * time.Duration(wheel.ticksWheel) {
-		panic("cant wait too long")
+func (w *TimeWheel) Add(timeout time.Duration, do func()) {
+	sum, index := w.getReal(timeout)
+	index =  ( index + w.currentTick ) % w.tickLife
+	sj := &SlotJob{
+		sum : sum,
+		do : do,
 	}
-	wheel.lock.Lock()
-	idx := timeout / wheel.tickPeriod
-	if idx > 0 {
-		idx --
+	slots := w.slots[index]
+	slots.lock.Lock()
+	slots.hooks.PushBack(sj)
+	slots.lock.Unlock()
+}
+
+func (w *TimeWheel) getReal(timeout time.Duration) (int,int) {
+	var sum,index int
+	if int ( timeout % ( w.period * time.Duration(w.tickLife) ) ) == 0 {
+		if timeout == 0 {
+			sum = 0
+			index = 0
+		} else {
+			sum = int(timeout / ( w.period * time.Duration(w.tickLife) )) - 1
+			index = w.tickLife
+		}
+	} else {
+		sum = int ( timeout / ( w.period * time.Duration(w.tickLife) ) )
+		tmp :=  (timeout) % ( w.period * time.Duration(w.tickLife) )
+		str := w.period.String()
+		if strings.Contains(str, "h") {
+			return sum, int(tmp / time.Hour)
+		}
+		if strings.Contains(str, "m"){
+			return sum, int(tmp / time.Minute)
+		}
+		if strings.Contains(str, "ns") {
+			return sum, int(tmp / time.Nanosecond)
+		}
+		if strings.Contains(str, "µs") {
+			return sum, int(tmp / time.Microsecond)
+		}
+		if strings.Contains(str, "ms") {
+			return sum, int(tmp / time.Millisecond)
+		}
+		if strings.Contains(str, "s") {
+			return sum, int(tmp / time.Second)
+		}
 	}
-	index := (wheel.currentTick + int(idx)) % wheel.ticksWheel
-	c := wheel.slots[index]
-	wheel.lock.Unlock()
-	return c
+	return sum,index
 }
-
-func (wheel *TimeWheel) Close(timeout time.Duration) {
-	wheel.quit <- true
-}
-
